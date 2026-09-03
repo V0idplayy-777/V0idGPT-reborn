@@ -1,0 +1,16 @@
+{
+  "name": "v0idgpt-reborn",
+  "version": "1.0.0",
+  "description": "A local, no-API transformer chatbot/training UI.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs": "^4.22.0",
+    "vite": "^8.2.2"
+  },
+  "devDependencies": {}
+}
