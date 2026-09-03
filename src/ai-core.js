@@ -7,6 +7,19 @@ const REPAIR_YIELD_INTERVAL = 8;
 
 export const MODEL_PRESETS = [
   {
+    id: '1param-joke',
+    name: '1 Parameter',
+    tagline: 'A single trainable number. Good luck.',
+    dModel: 1,
+    nLayers: 1,
+    nHeads: 1,
+    ffDim: 1,
+    context: 2,
+    defaultBatch: 1,
+    defaultLr: 0.1,
+    risk: 'safe',
+  },
+  {
     id: 'spark-80k',
     name: 'Spark 80K',
     tagline: 'Tiny local transformer for instant experiments.',
@@ -122,6 +135,19 @@ export const MODEL_PRESETS = [
     defaultBatch: 1,
     defaultLr: 0.00012,
     risk: 'extreme',
+  },
+  {
+    id: 'wtf-1.76q',
+    name: 'Fuckfuckfuck 1.76 Quadrillion',
+    tagline: 'Not a real trainable model.',
+    dModel: 65536,
+    nLayers: 34,
+    nHeads: 128,
+    ffDim: 262144,
+    context: 2048,
+    defaultBatch: 1,
+    defaultLr: 0.001,
+    risk: 'meltdown',
   },
   {
     id: 'singularity-1b',
@@ -369,7 +395,9 @@ export class LocalTransformerLM {
     this.vars[logicalName] = variable;
     this.trainableVars.push(variable);
     this.logicalNameByVariableName.set(variable.name, logicalName);
-    tensor.dispose();
+    // Do NOT dispose the initialization tensor immediately; in WebGL backends
+    // disposing it before the variable has fully settled can corrupt variable
+    // memory and lead to NaN weights / broken exports / constant K output.
     return variable;
   }
 
@@ -533,7 +561,7 @@ export class LocalTransformerLM {
     let skipped = false;
     const lossIsFinite = Number.isFinite(lossValue);
     const gradNormIsFinite = Number.isFinite(gradNormValue);
-    if (!lossIsFinite || !gradNormIsFinite) {
+    if (!lossIsFinite || !gradNormIsFinite || allFiniteGradValue !== 1) {
       skipped = true;
     } else if (clipNorm > 0 && gradNames.length > 0) {
       const scale = tf.tidy(() => tf.minimum(tf.scalar(1), tf.scalar(clipNorm).div(gradNormTensor.add(1e-8))));
@@ -585,6 +613,9 @@ export class LocalTransformerLM {
     const yieldEvery = Math.max(1, Number(options.yieldEvery ?? 6));
     const stopSequences = options.stopSequences ?? ['\nUser:', '\nUSER:', '\nHuman:'];
     const ids = this.tokenizer.encode(prompt);
+    // Repair any corruption left by unstable training so chat doesn't emit
+    // constant tokens (e.g. all "K") or throw non-finite errors.
+    await this.sanitizeWeights();
     let generated = '';
 
     for (let step = 0; step < maxNewTokens; step += 1) {
@@ -831,13 +862,19 @@ function float32ToBase64(values) {
   const chunkSize = 0x8000;
   for (let offset = 0; offset < bytes.length; offset += chunkSize) {
     const chunk = bytes.subarray(offset, offset + chunkSize);
-    binary += String.fromCharCode(...chunk);
+    for (let i = 0; i < chunk.length; i++) {
+      binary += String.fromCharCode(chunk[i]);
+    }
   }
-  return globalThis.btoa(binary);
+  const btoaFn = (globalThis && globalThis.btoa) ? globalThis.btoa : (typeof btoa === 'function' ? btoa : null);
+  if (!btoaFn) throw new Error('btoa is not available; cannot encode weights');
+  return btoaFn(binary);
 }
 
 function base64ToFloat32(base64) {
-  const binary = globalThis.atob(base64);
+  const atobFn = (globalThis && globalThis.atob) ? globalThis.atob : (typeof atob === 'function' ? atob : null);
+  if (!atobFn) throw new Error('atob is not available; cannot decode weights');
+  const binary = atobFn(base64);
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index += 1) {
     bytes[index] = binary.charCodeAt(index);

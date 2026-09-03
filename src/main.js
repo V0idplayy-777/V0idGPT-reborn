@@ -12,18 +12,19 @@ import {
   makeBatch,
 } from './ai-core.js';
 
-const DEMO_CORPUS = `V0idGPT Reborn is a local transformer chatbot. It does not call an external API. It studies the training text, predicts the next token, and generates new text one token at a time.
+const DEMO_CORPUS = `V0idGPT Reborn is a local transformer chatbot. It learns to speak by studying the text you paste. The more dialogue and patterns you give it, the better it predicts the next word.
 
 User: What are you?
-Assistant: I am a locally trained decoder-only transformer. I use embeddings, causal self-attention, feed-forward layers, layer normalization, Adam training, and probabilistic sampling.
+Assistant: I am a locally trained decoder-only transformer. I learn patterns from your text, not from the internet. I use embeddings, causal self-attention, feed-forward layers, layer normalization, and Adam training.
 
-User: How should you answer?
-Assistant: I should answer from patterns I learned in the text. I should be direct, helpful, technical, and honest about uncertainty.
+User: How do you answer?
+Assistant: I predict the next token from patterns I have seen. I should be direct, helpful, and admit when I am unsure. Good results need good training text and enough steps.
+
+User: How do I make you talk properly?
+Assistant: Paste dialogue or notes into the training box. Use at least a few sentences of back-and-forth. Train for more steps. The model learns your style from the text, not from a hardcoded brain.
 
 User: Explain local training.
-Assistant: Paste text into the training box, choose a model size, train for steps, then chat. More data and more steps improve the generated responses.
-
-A transformer learns by comparing its predicted next token to the real next token. The loss falls when the model gets better. A larger model can learn richer structure, but it also needs much more memory and time.`;
+Assistant: Choose a model size, paste training text, then click Start training. The model compares predicted tokens to real tokens and updates weights. Larger models learn more structure but need more memory and time.`;
 
 const state = {
   backendReady: false,
@@ -342,6 +343,10 @@ function unknownCharacters(text, tokenizer) {
 async function initializeSelectedModel({ quiet = false } = {}) {
   if (!state.backendReady) await setupBackend();
   const preset = state.selectedPreset;
+  if (preset && preset.id === 'wtf-1.76q') {
+    window.alert('What the fuck?');
+    return false;
+  }
   const seedText = `${refs.trainText.value}\n${state.chatLog}\nUser:\nAssistant:\n`;
   const nextTokenizer = new CharTokenizer(seedText);
   const params = estimateParams(preset, nextTokenizer.vocabSize);
@@ -470,7 +475,7 @@ async function startTraining() {
         updateStatus(`grad norm ${result.gradNorm.toFixed(3)}${badGradNote} · backend ${tf.getBackend()} · tensors ${tf.memory().numTensors} · ${bytesToHuman(tf.memory().numBytes)}`, result.hadBadGradients ? 'warn' : 'busy');
         refreshRuntimeStats();
       }
-      if (step % 2 === 0) await tf.nextFrame();
+      if (step % 10 === 0) await tf.nextFrame();
     }
 
     if (state.abortTraining) {
