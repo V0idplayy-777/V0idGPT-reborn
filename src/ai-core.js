@@ -1,6 +1,9 @@
 import * as tf from '@tensorflow/tfjs';
 
 export const ESTIMATE_VOCAB_SIZE = 256;
+export const EXPORT_FORMAT = 'v0idgpt-local-transformer-v2';
+const MAX_ABS_WEIGHT = 30;
+const REPAIR_YIELD_INTERVAL = 8;
 
 export const MODEL_PRESETS = [
   {
@@ -13,7 +16,7 @@ export const MODEL_PRESETS = [
     ffDim: 192,
     context: 64,
     defaultBatch: 16,
-    defaultLr: 0.003,
+    defaultLr: 0.0015,
     risk: 'safe',
   },
   {
@@ -26,7 +29,7 @@ export const MODEL_PRESETS = [
     ffDim: 352,
     context: 96,
     defaultBatch: 12,
-    defaultLr: 0.0025,
+    defaultLr: 0.0012,
     risk: 'safe',
   },
   {
@@ -39,7 +42,7 @@ export const MODEL_PRESETS = [
     ffDim: 512,
     context: 128,
     defaultBatch: 10,
-    defaultLr: 0.002,
+    defaultLr: 0.001,
     risk: 'safe',
   },
   {
@@ -52,7 +55,7 @@ export const MODEL_PRESETS = [
     ffDim: 640,
     context: 160,
     defaultBatch: 8,
-    defaultLr: 0.0015,
+    defaultLr: 0.0008,
     risk: 'safe',
   },
   {
@@ -65,7 +68,7 @@ export const MODEL_PRESETS = [
     ffDim: 1024,
     context: 256,
     defaultBatch: 4,
-    defaultLr: 0.001,
+    defaultLr: 0.0006,
     risk: 'caution',
   },
   {
@@ -78,7 +81,7 @@ export const MODEL_PRESETS = [
     ffDim: 2048,
     context: 384,
     defaultBatch: 1,
-    defaultLr: 0.0008,
+    defaultLr: 0.00035,
     risk: 'warning',
   },
   {
@@ -91,7 +94,7 @@ export const MODEL_PRESETS = [
     ffDim: 3072,
     context: 512,
     defaultBatch: 1,
-    defaultLr: 0.0006,
+    defaultLr: 0.00025,
     risk: 'danger',
   },
   {
@@ -104,7 +107,7 @@ export const MODEL_PRESETS = [
     ffDim: 4096,
     context: 768,
     defaultBatch: 1,
-    defaultLr: 0.00045,
+    defaultLr: 0.00018,
     risk: 'extreme',
   },
   {
@@ -117,7 +120,7 @@ export const MODEL_PRESETS = [
     ffDim: 8192,
     context: 1024,
     defaultBatch: 1,
-    defaultLr: 0.0003,
+    defaultLr: 0.00012,
     risk: 'extreme',
   },
   {
@@ -130,7 +133,7 @@ export const MODEL_PRESETS = [
     ffDim: 16384,
     context: 2048,
     defaultBatch: 1,
-    defaultLr: 0.0002,
+    defaultLr: 0.00008,
     risk: 'meltdown',
   },
 ].map((preset) => ({
@@ -327,28 +330,31 @@ export class LocalTransformerLM {
 
   initVariables() {
     const { dModel: d, context, nLayers, ffDim: ff } = this.config;
+    // GPT-style small initialization. The previous Xavier-ish scale was too hot
+    // in WebGL and could blow weights into NaN, which JSON.stringify displayed as null.
     const tokenScale = 0.02;
+    const linearScale = 0.02;
+    const residualScale = 0.02 / Math.sqrt(Math.max(1, 2 * nLayers));
     this.register('tokenEmbedding', normalInit([this.vocabSize, d], tokenScale, 11));
     this.register('positionEmbedding', normalInit([context, d], tokenScale, 12));
 
     for (let layer = 0; layer < nLayers; layer += 1) {
       const prefix = `block${layer}`;
-      const scale = 1 / Math.sqrt(d);
       this.register(`${prefix}/ln1/gamma`, ones([d]));
       this.register(`${prefix}/ln1/beta`, zeros([d]));
-      this.register(`${prefix}/attn/wq`, normalInit([d, d], scale, 101 + layer * 20));
+      this.register(`${prefix}/attn/wq`, normalInit([d, d], linearScale, 101 + layer * 20));
       this.register(`${prefix}/attn/bq`, zeros([d]));
-      this.register(`${prefix}/attn/wk`, normalInit([d, d], scale, 102 + layer * 20));
+      this.register(`${prefix}/attn/wk`, normalInit([d, d], linearScale, 102 + layer * 20));
       this.register(`${prefix}/attn/bk`, zeros([d]));
-      this.register(`${prefix}/attn/wv`, normalInit([d, d], scale, 103 + layer * 20));
+      this.register(`${prefix}/attn/wv`, normalInit([d, d], linearScale, 103 + layer * 20));
       this.register(`${prefix}/attn/bv`, zeros([d]));
-      this.register(`${prefix}/attn/wo`, normalInit([d, d], scale, 104 + layer * 20));
+      this.register(`${prefix}/attn/wo`, normalInit([d, d], residualScale, 104 + layer * 20));
       this.register(`${prefix}/attn/bo`, zeros([d]));
       this.register(`${prefix}/ln2/gamma`, ones([d]));
       this.register(`${prefix}/ln2/beta`, zeros([d]));
-      this.register(`${prefix}/ffn/w1`, normalInit([d, ff], Math.sqrt(2 / d), 201 + layer * 20));
+      this.register(`${prefix}/ffn/w1`, normalInit([d, ff], linearScale, 201 + layer * 20));
       this.register(`${prefix}/ffn/b1`, zeros([ff]));
-      this.register(`${prefix}/ffn/w2`, normalInit([ff, d], Math.sqrt(2 / ff), 202 + layer * 20));
+      this.register(`${prefix}/ffn/w2`, normalInit([ff, d], residualScale, 202 + layer * 20));
       this.register(`${prefix}/ffn/b2`, zeros([d]));
     }
 
@@ -463,15 +469,27 @@ export class LocalTransformerLM {
       const logits = this.forward(xs);
       const [batch, sequenceLength, vocabSize] = logits.shape;
       const flatLogits = logits.reshape([batch * sequenceLength, vocabSize]);
-      const labels = tf.oneHot(ys.flatten(), vocabSize);
-      return tf.losses.softmaxCrossEntropy(labels, flatLogits).mean();
+      const flatLabels = ys.flatten();
+
+      // Stable sparse softmax cross entropy:
+      // log(sum(exp(logits))) - logits[label], with log-sum-exp stabilization.
+      // This avoids the older one-hot path and is harder to push into NaN.
+      const maxLogits = flatLogits.max(-1, true);
+      const shifted = flatLogits.sub(maxLogits);
+      const logSumExp = tf.log(tf.exp(shifted).sum(-1)).add(maxLogits.squeeze([-1]));
+      // gatherND has incomplete gradient support in some tfjs backends, so use
+      // oneHot only for the target lookup while keeping the stable log-sum-exp loss.
+      const labelMask = tf.oneHot(flatLabels, vocabSize);
+      const trueLogits = flatLogits.mul(labelMask).sum(-1);
+      return logSumExp.sub(trueLogits).mean();
     });
   }
 
   ensureOptimizer(learningRate) {
     const key = `${learningRate}`;
     if (!this.optimizer || this.optimizerKey !== key) {
-      this.optimizer = tf.train.adam(learningRate, 0.9, 0.95, 1e-8);
+      // Larger epsilon is more stable on browser/WebGL backends.
+      this.optimizer = tf.train.adam(learningRate, 0.9, 0.95, 1e-6);
       this.optimizerKey = key;
     }
   }
@@ -484,26 +502,52 @@ export class LocalTransformerLM {
 
     const { value, grads } = tf.variableGrads(() => tf.tidy(() => this.lossForBatch(xs, ys)), this.trainableVars);
     const gradNames = Object.keys(grads);
+    const safeGrads = {};
     let gradNormTensor = null;
+    let allFiniteGradTensor = null;
     let clippedGrads = null;
 
-    if (clipNorm > 0 && gradNames.length > 0) {
+    for (const name of gradNames) {
+      safeGrads[name] = tf.tidy(() => tf.where(tf.isFinite(grads[name]), grads[name], tf.zerosLike(grads[name])));
+    }
+
+    if (gradNames.length > 0) {
       gradNormTensor = tf.tidy(() => {
-        const squaredSums = gradNames.map((name) => grads[name].square().sum());
+        const squaredSums = gradNames.map((name) => safeGrads[name].square().sum());
         return tf.sqrt(tf.addN(squaredSums).add(1e-12));
       });
+      allFiniteGradTensor = tf.tidy(() => {
+        const checks = gradNames.map((name) => tf.all(tf.isFinite(grads[name])));
+        return tf.all(tf.stack(checks));
+      });
+    }
+
+    // Read numeric health BEFORE applyGradients. The old code applied first, so a
+    // single NaN loss/gradient permanently poisoned the weights and export became nulls.
+    const [lossValue, gradNormValue, allFiniteGradValue] = await Promise.all([
+      value.data().then((data) => data[0]),
+      gradNormTensor ? gradNormTensor.data().then((data) => data[0]) : Promise.resolve(0),
+      allFiniteGradTensor ? allFiniteGradTensor.data().then((data) => data[0]) : Promise.resolve(1),
+    ]);
+
+    let skipped = false;
+    const lossIsFinite = Number.isFinite(lossValue);
+    const gradNormIsFinite = Number.isFinite(gradNormValue);
+    if (!lossIsFinite || !gradNormIsFinite) {
+      skipped = true;
+    } else if (clipNorm > 0 && gradNames.length > 0) {
       const scale = tf.tidy(() => tf.minimum(tf.scalar(1), tf.scalar(clipNorm).div(gradNormTensor.add(1e-8))));
       clippedGrads = {};
       for (const name of gradNames) {
-        clippedGrads[name] = tf.tidy(() => grads[name].mul(scale));
+        clippedGrads[name] = tf.tidy(() => safeGrads[name].mul(scale));
       }
       scale.dispose();
       this.optimizer.applyGradients(clippedGrads);
     } else {
-      this.optimizer.applyGradients(grads);
+      this.optimizer.applyGradients(safeGrads);
     }
 
-    if (weightDecay > 0) {
+    if (!skipped && weightDecay > 0) {
       const decayScale = Math.max(0, 1 - learningRate * weightDecay);
       for (const variable of this.trainableVars) {
         const logicalName = this.logicalNameByVariableName.get(variable.name) ?? '';
@@ -514,29 +558,31 @@ export class LocalTransformerLM {
       }
     }
 
-    const [lossValue, gradNormValue] = await Promise.all([
-      value.data().then((data) => data[0]),
-      gradNormTensor ? gradNormTensor.data().then((data) => data[0]) : Promise.resolve(0),
-    ]);
-
     value.dispose();
     if (gradNormTensor) gradNormTensor.dispose();
+    if (allFiniteGradTensor) allFiniteGradTensor.dispose();
     Object.values(grads).forEach((tensor) => tensor.dispose());
+    Object.values(safeGrads).forEach((tensor) => tensor.dispose());
     if (clippedGrads) Object.values(clippedGrads).forEach((tensor) => tensor.dispose());
 
     return {
       loss: lossValue,
       gradNorm: gradNormValue,
-      perplexity: Math.exp(Math.min(20, lossValue)),
+      perplexity: Number.isFinite(lossValue) ? Math.exp(Math.min(20, lossValue)) : Infinity,
+      skipped,
+      hadBadGradients: allFiniteGradValue !== 1,
     };
   }
 
   async generate(prompt, options = {}, onToken = () => {}) {
-    const maxNewTokens = Number(options.maxNewTokens ?? 240);
+    const maxNewTokens = Number(options.maxNewTokens ?? 180);
     const temperature = Math.max(0.05, Number(options.temperature ?? 0.85));
     const topK = Math.max(1, Number(options.topK ?? 40));
     const topP = Math.min(1, Math.max(0.01, Number(options.topP ?? 0.92)));
     const repetitionPenalty = Math.max(1, Number(options.repetitionPenalty ?? 1.08));
+    const maxRepeat = Math.max(2, Number(options.maxRepeat ?? 8));
+    const streamEvery = Math.max(1, Number(options.streamEvery ?? 3));
+    const yieldEvery = Math.max(1, Number(options.yieldEvery ?? 6));
     const stopSequences = options.stopSequences ?? ['\nUser:', '\nUSER:', '\nHuman:'];
     const ids = this.tokenizer.encode(prompt);
     let generated = '';
@@ -550,57 +596,120 @@ export class LocalTransformerLM {
         return logits.slice([0, contextIds.length - 1, 0], [1, 1, this.vocabSize]).reshape([this.vocabSize]);
       });
       input.dispose();
-      const logits = Array.from(await logitsTensor.data());
+      const logits = Array.from(await logitsTensor.data(), (value) => (Number.isFinite(value) ? value : -Infinity));
       logitsTensor.dispose();
 
+      if (!logits.some(Number.isFinite)) {
+        throw new Error('Model produced non-finite logits. The weights are numerically corrupted; repair or reinitialize the model.');
+      }
+
       applyRepetitionPenalty(logits, ids.slice(-128), repetitionPenalty);
+      blockDegenerateRepeat(logits, ids, maxRepeat);
       const nextId = sampleFromLogits(logits, { temperature, topK, topP });
       ids.push(nextId);
       const piece = this.tokenizer.decode([nextId]);
       generated += piece;
-      onToken(piece, generated);
+      const shouldStream = step % streamEvery === 0 || step === maxNewTokens - 1;
+      if (shouldStream) onToken(piece, generated, { step, done: false });
 
       if (stopSequences.some((sequence) => generated.includes(sequence))) {
         generated = trimAtStop(generated, stopSequences);
+        onToken('', generated, { step, done: true });
         break;
       }
-      await tf.nextFrame();
+      if (step % yieldEvery === yieldEvery - 1) await tf.nextFrame();
     }
 
+    onToken('', generated, { step: Math.min(maxNewTokens, generated.length), done: true });
     return generated;
   }
 
-  async exportJSON() {
+  async sanitizeWeights(options = {}) {
+    const maxAbsWeight = Number(options.maxAbsWeight ?? MAX_ABS_WEIGHT);
+    const stats = {
+      tensorsChecked: 0,
+      valuesChecked: 0,
+      nonFinite: 0,
+      clipped: 0,
+      repairedTensors: 0,
+    };
+
+    let index = 0;
+    for (const variable of Object.values(this.vars)) {
+      const raw = await variable.data();
+      const cleaned = new Float32Array(raw.length);
+      let changed = false;
+      for (let i = 0; i < raw.length; i += 1) {
+        const value = raw[i];
+        stats.valuesChecked += 1;
+        if (!Number.isFinite(value)) {
+          cleaned[i] = 0;
+          stats.nonFinite += 1;
+          changed = true;
+        } else if (Math.abs(value) > maxAbsWeight) {
+          cleaned[i] = Math.sign(value) * maxAbsWeight;
+          stats.clipped += 1;
+          changed = true;
+        } else {
+          cleaned[i] = value;
+        }
+      }
+      stats.tensorsChecked += 1;
+      if (changed) {
+        const tensor = tf.tensor(cleaned, variable.shape, 'float32');
+        variable.assign(tensor);
+        tensor.dispose();
+        stats.repairedTensors += 1;
+      }
+      index += 1;
+      if (index % REPAIR_YIELD_INTERVAL === 0) await tf.nextFrame();
+    }
+
+    return stats;
+  }
+
+  async exportJSON(options = {}) {
+    const repairStats = await this.sanitizeWeights({ maxAbsWeight: options.maxAbsWeight ?? MAX_ABS_WEIGHT });
     const weights = [];
     for (const [name, variable] of Object.entries(this.vars)) {
+      const data = await variable.data();
       weights.push({
         name,
         shape: variable.shape,
-        data: Array.from(await variable.data()),
+        dtype: 'float32',
+        encoding: 'base64-f32-le',
+        data: float32ToBase64(data),
       });
     }
     return {
-      format: 'v0idgpt-local-transformer-v1',
+      format: EXPORT_FORMAT,
+      compatibleFormats: ['v0idgpt-local-transformer-v1'],
       createdAt: new Date().toISOString(),
       config: this.config,
       tokenizer: this.tokenizer.toJSON(),
+      exportStats: repairStats,
       weights,
     };
   }
 
   async importWeights(weights) {
+    let repairedValues = 0;
     for (const item of weights) {
       const variable = this.vars[item.name];
       if (!variable) continue;
       const expected = product(variable.shape);
-      if (expected !== item.data.length) {
-        throw new Error(`Weight ${item.name} has ${item.data.length} values, expected ${expected}.`);
+      const decoded = decodeWeightItem(item);
+      if (expected !== decoded.length) {
+        throw new Error(`Weight ${item.name} has ${decoded.length} values, expected ${expected}.`);
       }
-      const tensor = tf.tensor(item.data, item.shape, 'float32');
+      const sanitized = sanitizeNumberArray(decoded, MAX_ABS_WEIGHT);
+      repairedValues += sanitized.stats.nonFinite + sanitized.stats.clipped;
+      const tensor = tf.tensor(sanitized.values, item.shape, 'float32');
       variable.assign(tensor);
       tensor.dispose();
       await tf.nextFrame();
     }
+    return { repairedValues };
   }
 
   dispose() {
@@ -636,14 +745,23 @@ export function makeBatch(encodedIds, context, batchSize) {
 }
 
 export function sampleFromLogits(logits, { temperature = 1, topK = 40, topP = 0.92 } = {}) {
-  const ranked = logits
-    .map((value, index) => ({ index, value: value / temperature }))
+  let ranked = logits
+    .map((value, index) => ({ index, value: Number.isFinite(value) ? value / temperature : -Infinity }))
+    .filter((item) => Number.isFinite(item.value))
     .sort((a, b) => b.value - a.value)
     .slice(0, Math.min(topK, logits.length));
 
-  const max = ranked[0]?.value ?? 0;
-  let probabilities = ranked.map((item) => ({ ...item, probability: Math.exp(item.value - max) }));
-  let total = probabilities.reduce((sum, item) => sum + item.probability, 0) || 1;
+  if (ranked.length === 0) {
+    throw new Error('No finite logits available for sampling.');
+  }
+
+  const max = ranked[0].value;
+  let probabilities = ranked.map((item) => ({
+    ...item,
+    probability: Math.exp(Math.max(-80, Math.min(80, item.value - max))),
+  }));
+  let total = probabilities.reduce((sum, item) => sum + item.probability, 0);
+  if (!Number.isFinite(total) || total <= 0) return ranked[0].index;
   probabilities = probabilities.map((item) => ({ ...item, probability: item.probability / total }));
 
   if (topP < 1) {
@@ -654,8 +772,9 @@ export function sampleFromLogits(logits, { temperature = 1, topK = 40, topP = 0.
       nucleus.push(item);
       if (cumulative >= topP) break;
     }
-    probabilities = nucleus;
-    total = probabilities.reduce((sum, item) => sum + item.probability, 0) || 1;
+    probabilities = nucleus.length ? nucleus : [probabilities[0]];
+    total = probabilities.reduce((sum, item) => sum + item.probability, 0);
+    if (!Number.isFinite(total) || total <= 0) return probabilities[0].index;
     probabilities = probabilities.map((item) => ({ ...item, probability: item.probability / total }));
   }
 
@@ -664,16 +783,77 @@ export function sampleFromLogits(logits, { temperature = 1, topK = 40, topP = 0.
     roll -= item.probability;
     if (roll <= 0) return item.index;
   }
-  return probabilities[probabilities.length - 1]?.index ?? 0;
+  return probabilities[probabilities.length - 1]?.index ?? ranked[0].index;
 }
 
 function applyRepetitionPenalty(logits, recentIds, penalty) {
   if (penalty <= 1) return;
-  const seen = new Set(recentIds);
-  for (const id of seen) {
-    if (id < 0 || id >= logits.length) continue;
-    logits[id] = logits[id] > 0 ? logits[id] / penalty : logits[id] * penalty;
+  const counts = new Map();
+  for (const id of recentIds) counts.set(id, (counts.get(id) ?? 0) + 1);
+  for (const [id, count] of counts) {
+    if (id < 0 || id >= logits.length || !Number.isFinite(logits[id])) continue;
+    const adjustedPenalty = penalty ** Math.min(4, count);
+    logits[id] = logits[id] > 0 ? logits[id] / adjustedPenalty : logits[id] * adjustedPenalty;
   }
+}
+
+function blockDegenerateRepeat(logits, ids, maxRepeat) {
+  const lastId = ids[ids.length - 1];
+  if (lastId === undefined) return;
+  let run = 0;
+  for (let i = ids.length - 1; i >= 0 && ids[i] === lastId; i -= 1) run += 1;
+  if (run >= maxRepeat && lastId >= 0 && lastId < logits.length) {
+    logits[lastId] = -Infinity;
+  }
+}
+
+function sanitizeNumberArray(values, maxAbsWeight = MAX_ABS_WEIGHT) {
+  const cleaned = new Float32Array(values.length);
+  const stats = { nonFinite: 0, clipped: 0 };
+  for (let index = 0; index < values.length; index += 1) {
+    const value = values[index];
+    if (!Number.isFinite(value)) {
+      cleaned[index] = 0;
+      stats.nonFinite += 1;
+    } else if (Math.abs(value) > maxAbsWeight) {
+      cleaned[index] = Math.sign(value) * maxAbsWeight;
+      stats.clipped += 1;
+    } else {
+      cleaned[index] = value;
+    }
+  }
+  return { values: cleaned, stats };
+}
+
+function float32ToBase64(values) {
+  const bytes = new Uint8Array(values.buffer, values.byteOffset, values.byteLength);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    const chunk = bytes.subarray(offset, offset + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return globalThis.btoa(binary);
+}
+
+function base64ToFloat32(base64) {
+  const binary = globalThis.atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  const aligned = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  return new Float32Array(aligned);
+}
+
+function decodeWeightItem(item) {
+  if (item.encoding === 'base64-f32-le') {
+    return base64ToFloat32(item.data);
+  }
+  if (Array.isArray(item.data)) {
+    return item.data;
+  }
+  throw new Error(`Unsupported weight encoding for ${item.name}.`);
 }
 
 function trimAtStop(text, stopSequences) {

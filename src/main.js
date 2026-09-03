@@ -93,7 +93,7 @@ app.innerHTML = `
         <div class="controls-grid">
           <label>Steps<input id="stepsInput" type="number" min="1" max="100000" value="120" /></label>
           <label>Batch<input id="batchInput" type="number" min="1" max="128" value="16" /></label>
-          <label>Learning rate<input id="lrInput" type="number" step="0.0001" min="0.00001" value="0.003" /></label>
+          <label>Learning rate<input id="lrInput" type="number" step="0.0001" min="0.00001" value="0.0015" /></label>
           <label>Grad clip<input id="clipInput" type="number" step="0.1" min="0" value="1" /></label>
           <label>AdamW decay<input id="decayInput" type="number" step="0.001" min="0" value="0.01" /></label>
           <label>Report every<input id="reportInput" type="number" min="1" max="1000" value="5" /></label>
@@ -114,8 +114,9 @@ app.innerHTML = `
         </div>
 
         <div class="button-row thin">
-          <button class="ghost-button" id="exportModel" disabled>Export weights JSON</button>
-          <label class="ghost-button file-button" for="importModel">Import weights JSON</label>
+          <button class="ghost-button" id="repairWeights" disabled>Repair NaN/Inf weights</button>
+          <button class="ghost-button" id="exportModel" disabled>Export compact JSON</button>
+          <label class="ghost-button file-button" for="importModel">Import JSON</label>
           <input id="importModel" type="file" accept="application/json,.json" hidden />
         </div>
       </section>
@@ -139,7 +140,7 @@ app.innerHTML = `
         </div>
 
         <div class="sampling-controls">
-          <label>Max tokens<input id="maxTokensInput" type="number" min="1" max="2000" value="260" /></label>
+          <label>Max tokens<input id="maxTokensInput" type="number" min="1" max="2000" value="180" /></label>
           <label>Temperature<input id="tempInput" type="number" min="0.05" max="2" step="0.05" value="0.85" /></label>
           <label>Top-K<input id="topKInput" type="number" min="1" max="256" value="40" /></label>
           <label>Top-P<input id="topPInput" type="number" min="0.01" max="1" step="0.01" value="0.92" /></label>
@@ -156,8 +157,8 @@ app.innerHTML = `
         <ul>
           <li>Vectorized TensorFlow.js matmuls with WebGL acceleration when available.</li>
           <li>True causal multi-head self-attention, learned token/position embeddings, GELU FFN, residuals, and layer norm.</li>
-          <li>Adam optimizer, gradient clipping, AdamW-style decay, batched random training windows, and aggressive tensor disposal.</li>
-          <li>Top-K + nucleus sampling and repetition penalty for faster, cleaner decoding without hardcoded replies.</li>
+          <li>Adam optimizer, stable sparse cross-entropy, pre-apply NaN guards, gradient clipping, AdamW-style decay, and aggressive tensor disposal.</li>
+          <li>Compact base64 weight export, NaN/Inf repair, Top-K + nucleus sampling, loop blocking, and repetition penalty.</li>
         </ul>
       </section>
     </main>
@@ -191,6 +192,7 @@ const refs = {
   trainMetrics: $('#trainMetrics'),
   startTrain: $('#startTrain'),
   stopTrain: $('#stopTrain'),
+  repairWeights: $('#repairWeights'),
   exportModel: $('#exportModel'),
   importModel: $('#importModel'),
   chatMessages: $('#chatMessages'),
@@ -281,8 +283,9 @@ async function setupBackend() {
   refs.backendDot.classList.add('loading');
   try {
     // Quality-safe WebGL packing: faster tensor math without replacing the model with shortcuts.
+    // Do not force half-float textures; that can destabilize training on some GPUs.
     tf.env().set('WEBGL_PACK', true);
-    tf.env().set('WEBGL_DELETE_TEXTURE_THRESHOLD', 0);
+    tf.env().set('WEBGL_FORCE_F16_TEXTURES', false);
   } catch {
     // Some backends lock flags after initialization. Safe to ignore.
   }
@@ -306,6 +309,7 @@ function refreshRuntimeStats() {
   refs.backendName.textContent = `Backend: ${tf.getBackend()}`;
   refs.runtimeStats.textContent = `${modelParams} · tensors ${memory.numTensors} · ${bytesToHuman(memory.numBytes)} tensor memory · trained steps ${state.trainedSteps}`;
   refs.exportModel.disabled = !state.model || state.isTraining;
+  refs.repairWeights.disabled = !state.model || state.isTraining;
 }
 
 function setTrainState(label, busy = false) {
@@ -314,6 +318,7 @@ function setTrainState(label, busy = false) {
   refs.startTrain.disabled = busy;
   refs.stopTrain.disabled = !busy;
   refs.initModel.disabled = busy;
+  refs.repairWeights.disabled = busy || !state.model;
 }
 
 function getTrainingCorpus() {
@@ -430,6 +435,7 @@ async function startTraining() {
 
   const startedAt = performance.now();
   let tokenCounter = 0;
+  let stoppedForNumericSafety = false;
 
   try {
     for (let step = 1; step <= steps; step += 1) {
@@ -439,25 +445,39 @@ async function startTraining() {
       const result = await state.model.trainStep(xs, ys, { learningRate, clipNorm, weightDecay });
       xs.dispose();
       ys.dispose();
+
+      if (result.skipped || !Number.isFinite(result.loss) || !Number.isFinite(result.gradNorm)) {
+        state.abortTraining = true;
+        stoppedForNumericSafety = true;
+        refs.progressLabel.textContent = `Stopped safely at step ${step}/${steps}.`;
+        refs.lossLabel.textContent = 'loss: non-finite';
+        updateStatus('A non-finite loss/gradient was detected BEFORE applying it, so the weights were not poisoned. Lower the learning rate or batch size, then resume or reinitialize.', 'error');
+        addSystemMessage('Training stopped safely because a NaN/Infinity was detected before it could corrupt the model.');
+        break;
+      }
+
       tokenCounter += batchSize * sequenceLength;
       state.trainedSteps += 1;
       state.lastLoss = result.loss;
 
-      if (step === 1 || step % reportEvery === 0 || step === steps) {
+      if (step === 1 || step % reportEvery === 0 || step === steps || result.hadBadGradients) {
         const elapsedSeconds = Math.max(0.001, (performance.now() - startedAt) / 1000);
         const instantSeconds = Math.max(0.001, (performance.now() - stepStarted) / 1000);
         refs.trainProgress.value = (step / steps) * 100;
         refs.progressLabel.textContent = `step ${step}/${steps} · ${Math.round(tokenCounter / elapsedSeconds)} tok/s avg · ${Math.round((batchSize * sequenceLength) / instantSeconds)} tok/s step`;
         refs.lossLabel.textContent = `loss: ${result.loss.toFixed(4)} · ppl: ${result.perplexity.toFixed(1)}`;
-        updateStatus(`grad norm ${result.gradNorm.toFixed(3)} · backend ${tf.getBackend()} · tensors ${tf.memory().numTensors} · ${bytesToHuman(tf.memory().numBytes)}`, 'busy');
+        const badGradNote = result.hadBadGradients ? ' · bad grad entries zeroed' : '';
+        updateStatus(`grad norm ${result.gradNorm.toFixed(3)}${badGradNote} · backend ${tf.getBackend()} · tensors ${tf.memory().numTensors} · ${bytesToHuman(tf.memory().numBytes)}`, result.hadBadGradients ? 'warn' : 'busy');
         refreshRuntimeStats();
       }
-      await tf.nextFrame();
+      if (step % 2 === 0) await tf.nextFrame();
     }
 
     if (state.abortTraining) {
-      updateStatus('Training stopped by user. Current weights are kept.', 'warn');
-      refs.progressLabel.textContent = 'Training stopped.';
+      if (!stoppedForNumericSafety) {
+        updateStatus('Training stopped by user. Current weights are kept.', 'warn');
+        refs.progressLabel.textContent = 'Training stopped.';
+      }
     } else {
       updateStatus('Training complete. Chat now uses the weights you trained.', 'ok');
       refs.progressLabel.textContent = `Finished ${steps} steps.`;
@@ -497,8 +517,14 @@ function addSystemMessage(text) {
 }
 
 async function sendChat() {
+  if (state.generationAbort) {
+    state.generationAbort.abort();
+    refs.sendChat.textContent = 'Stopping…';
+    return;
+  }
+
   const input = refs.chatInput.value.trim();
-  if (!input || state.generationAbort) return;
+  if (!input) return;
   if (!state.model) {
     const initialized = await initializeSelectedModel({ quiet: true });
     if (!initialized) return;
@@ -511,36 +537,59 @@ async function sendChat() {
   const prompt = `${state.chatLog}User: ${input}\nAssistant:`;
   const abort = new AbortController();
   state.generationAbort = abort;
-  refs.sendChat.textContent = 'Generating…';
-  refs.sendChat.disabled = true;
+  refs.sendChat.textContent = 'Stop';
 
+  const startedAt = performance.now();
   try {
     const generated = await state.model.generate(prompt, {
-      maxNewTokens: Number(refs.maxTokensInput.value || 260),
+      maxNewTokens: Number(refs.maxTokensInput.value || 180),
       temperature: Number(refs.tempInput.value || 0.85),
       topK: Number(refs.topKInput.value || 40),
       topP: Number(refs.topPInput.value || 0.92),
       repetitionPenalty: Number(refs.repInput.value || 1.08),
+      streamEvery: 3,
+      yieldEvery: 6,
+      maxRepeat: 8,
       signal: abort.signal,
     }, (_piece, fullText) => {
       assistantBody.textContent = fullText;
       refs.chatMessages.scrollTop = refs.chatMessages.scrollHeight;
     });
 
-    assistantBody.textContent = generated;
+    const seconds = Math.max(0.001, (performance.now() - startedAt) / 1000);
+    assistantBody.textContent = generated || '(stopped)';
     state.chatLog = `${prompt}${generated}\n`;
-    if (refs.autoTrainChat.checked) {
+    updateStatus(`Generated ${state.tokenizer.encode(generated).length} tokens in ${seconds.toFixed(1)}s.`, 'ok');
+    if (refs.autoTrainChat.checked && generated.trim()) {
       refs.trainText.value = `${refs.trainText.value}${refs.trainText.value.trim() ? '\n\n' : ''}User: ${input}\nAssistant: ${generated}`;
     }
     refreshRuntimeStats();
   } catch (error) {
     console.error(error);
-    assistantBody.textContent = `Generation failed: ${error.message}`;
+    if (String(error.message).includes('non-finite')) {
+      const stats = await repairWeights({ silent: true });
+      assistantBody.textContent = `Generation stopped because corrupted NaN/Inf weights were detected. I repaired ${stats.nonFinite + stats.clipped} bad values. Try generating again; if it still looks broken, reinitialize and train with a lower learning rate.`;
+    } else {
+      assistantBody.textContent = `Generation failed: ${error.message}`;
+    }
   } finally {
     state.generationAbort = null;
     refs.sendChat.textContent = 'Generate';
-    refs.sendChat.disabled = false;
   }
+}
+
+async function repairWeights({ silent = false } = {}) {
+  if (!state.model) return { nonFinite: 0, clipped: 0, repairedTensors: 0 };
+  updateStatus('Scanning and repairing NaN/Inf weights…', 'busy');
+  const stats = await state.model.sanitizeWeights();
+  const repaired = stats.nonFinite + stats.clipped;
+  const message = repaired
+    ? `Repaired ${stats.nonFinite} NaN/Inf values and clipped ${stats.clipped} runaway values across ${stats.repairedTensors} tensors.`
+    : `Weights look clean: ${stats.valuesChecked.toLocaleString()} finite values checked.`;
+  updateStatus(message, repaired ? 'warn' : 'ok');
+  if (!silent) addSystemMessage(message);
+  refreshRuntimeStats();
+  return stats;
 }
 
 async function exportModel() {
@@ -550,7 +599,7 @@ async function exportModel() {
     const ok = window.confirm(`Exporting ${formatParams(params)} parameters to JSON can be huge and slow. Continue?`);
     if (!ok) return;
   }
-  updateStatus('Serializing weights…', 'busy');
+  updateStatus('Repair-checking and serializing compact base64 weights…', 'busy');
   const payload = await state.model.exportJSON();
   const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -559,7 +608,8 @@ async function exportModel() {
   anchor.download = `${state.model.config.id ?? 'v0idgpt'}-${Date.now()}.json`;
   anchor.click();
   URL.revokeObjectURL(url);
-  updateStatus('Weights exported as JSON.', 'ok');
+  const repaired = payload.exportStats.nonFinite + payload.exportStats.clipped;
+  updateStatus(repaired ? `Exported compact JSON after repairing ${repaired} bad values. Weight arrays are encoded, so NaN cannot stringify into null.` : 'Exported compact JSON with encoded finite weights.', repaired ? 'warn' : 'ok');
 }
 
 async function importModel(file) {
@@ -567,7 +617,7 @@ async function importModel(file) {
   try {
     updateStatus('Reading model JSON…', 'busy');
     const json = JSON.parse(await file.text());
-    if (json.format !== 'v0idgpt-local-transformer-v1') {
+    if (!['v0idgpt-local-transformer-v1', 'v0idgpt-local-transformer-v2'].includes(json.format)) {
       throw new Error('Not a V0idGPT Reborn local transformer export.');
     }
     const tokenizer = CharTokenizer.fromJSON(json.tokenizer);
@@ -579,12 +629,13 @@ async function importModel(file) {
     state.model?.dispose();
     state.tokenizer = tokenizer;
     state.model = new LocalTransformerLM(json.config, tokenizer);
-    await state.model.importWeights(json.weights);
+    const importStats = await state.model.importWeights(json.weights);
     state.activeConfigId = json.config.id;
     const matchingPreset = MODEL_PRESETS.find((preset) => preset.id === json.config.id);
     if (matchingPreset) state.selectedPreset = matchingPreset;
-    updateStatus(`Imported ${formatParams(state.model.parameterCount())} trainable parameters.`, 'ok');
-    addSystemMessage(`Imported model ${json.config.name ?? json.config.id}.`);
+    const repairNote = importStats.repairedValues ? ` Repaired ${importStats.repairedValues} invalid imported values.` : '';
+    updateStatus(`Imported ${formatParams(state.model.parameterCount())} trainable parameters.${repairNote}`, importStats.repairedValues ? 'warn' : 'ok');
+    addSystemMessage(`Imported model ${json.config.name ?? json.config.id}.${repairNote}`);
     renderModelGrid();
     updateSelectedDetails();
     refreshRuntimeStats();
@@ -631,6 +682,7 @@ refs.clearChat.addEventListener('click', () => {
   state.chatLog = '';
   refs.chatMessages.innerHTML = '<div class="system-message">Chat cleared. The model weights are unchanged.</div>';
 });
+refs.repairWeights.addEventListener('click', () => repairWeights());
 refs.exportModel.addEventListener('click', exportModel);
 refs.importModel.addEventListener('change', (event) => importModel(event.target.files?.[0]));
 
